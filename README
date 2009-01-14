@@ -1,16 +1,56 @@
 MooseX-Contract
 
-The README is used to introduce the module and provide instructions on
-how to install the module, any machine dependencies it may have (for
-example C compilers and installed libraries) and any other information
-that should be provided before the module is installed.
++---------+
+| WARNING |
++---------+
 
-A README file is required for CPAN modules since CPAN extracts the README
-file from a module distribution so that people browsing the archive
-can use it to get an idea of the module's uses. It is usually a good idea
-to provide version information here so that people can decide whether
-fixes for the module are worth downloading.
+This module should be considered EXPERIMENTAL and should not be used in
+critical applications unless you're willing to deal with all the typical
+bugs that young, under-tested software has to offer!
 
++----------+
+| SYNOPSIS |
++----------+
+
+This module provides "Design by Contract" functionality using Moose
+method hooks.
+
+For example, in your Moose-built class:
+
+	package MyEvenInt;
+
+    use MooseX::Contract; # imports Moose for you!
+	use Moose::Util::TypeConstraints;
+
+	my $even_int = subtype 'Int', where { $_ % 2 == 0 };
+
+	invariant assert { shift->{value} % 2 == 0 } '$self->{value} must be an even integer';
+
+	has value => (
+		is       => 'rw',
+		isa      => $even_int,
+		required => 1,
+		default  => 0
+	);
+
+	contract 'add'
+		=> accepts [ $even_int ]
+		=> returns void;
+	sub add {
+		my $self = shift;
+		my $incr = shift;
+		$self->{value} += $incr;
+		return;
+	}
+
+	contract 'get_multiple'
+		=> accepts ['Int'],
+		=> returns [$even_int];
+	sub get_multiple {
+		return shift->{value} * shift;
+	}
+
+	no MooseX::Contract;
 
 INSTALLATION
 
