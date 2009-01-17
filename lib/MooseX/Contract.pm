@@ -11,7 +11,7 @@ use Moose::Util qw(add_method_modifier find_meta);
 
 Moose::Exporter->setup_import_methods(
 	with_caller => [ qw(invariant contract) ],
-	as_is => [qw(check assert accepts returns void)],
+	as_is => [qw(check assert accepts returns void with_context)],
 	also        => 'Moose',
 );
 
@@ -58,7 +58,18 @@ For example, in your Moose-built class:
 
 	contract 'add'
 		=> accepts [ $even_int ]
-		=> returns void;
+		=> returns void,
+		with_context(    # very contrived...
+			pre => sub {
+				my $self = shift;
+				my $add  = shift;
+				return [ $self->{value}, $add ];
+			},
+			post => assert {
+				my $pre = shift;
+				$pre->[0] + $pre->[1] == shift->{value};
+			}
+		);
 	sub add {
 		my $self = shift;
 		my $incr = shift;
@@ -75,19 +86,106 @@ For example, in your Moose-built class:
 
 	no MooseX::Contract;
 
+=head1 DESCRIPTION
+
+The Design by Contract (DbC) method of programming could be seen as
+simply baking some simple unit test or assertions right into your regular
+code path.  The set of assertions or tests for a given class is considered
+that class' contract - a guarantee of how any instance of that class will
+behave and appear.  This implementation of DbC provides three types of
+assertions (referred to here as "contract clauses") when defining your
+class' contract:
+
+=over 4
+
+=item C<pre> clause
+
+This clause is attached to a specific method and is executed before
+control is passed to the original method.  Typically, these could be
+used to validate incoming parameters but one might also validate state
+of the object itself in this type of clause.
+
+=item C<post> clause
+
+This clause is also attached to a specific method and is executed after
+the original method has been called.  This type of DbC clause has the
+opportunity to validate return values (or lack thereof) as well as the
+state of the object following the method.
+
+=item C<invariant> clause
+
+This is a special type of DbC clause that makes assertions about the
+ongoing state of the object.  These clauses are invoked after each
+public method (subs that don't begin with an underscore) is called.
+Unlike C<post> clauses, however, these clauses are only allowed to
+inspect the object's state (not the return values of the method).
+
+=back
+
+The contract clauses are created using a declarative syntax as inspired
+by the Moose syntax.
+
+One item worht noting: there's no guaranteed safe way to resume execution
+after a contract clause validation failure.  For instance, if a method does
+something naughty and causes a C<post> or C<invariant> clause to fail,
+the object in question may be irreperably broken.  Catching these errors
+and ignoring them (or in some cases, trying to handle them) is not
+advisable and makes the use of this module pointless.  These contract
+errors should be allowed to die an ugly death.  If you're concerned
+about the end user experience, you should disable all MooseX::Contract
+functionality in your production code and plan to have enough coverage
+in your development and test environments that you're comfortable with
+the checks not being in effect.
+
+
 =head1 EXPORT
 
-=head2 invariant
-
-This is a special kind of contract that adds a C<post> contract to all
-public method calls.  Typically you would use this to assert a specific
-characteristic about the object itself.
+The following subs are exported by default and will be removed from
+the caller's namespace using C<no MooseX::Contract>.
 
 =head2 contract
 
-This is the core method of the module.  It sets up a contract for a
+This is the core method of the module.  It sets up a contract clause for a
 specific method (or methods) and uses Moose's C<around> hook to execute
-the C<pre> and C<post> contracts that are specified.
+the C<pre> and C<post> clauses that are specified.  Some of the "sugar"
+listed below help with building up the contract that you want to express.
+
+The first argument to C<contract> is always the method name.  Following
+the method name, you must pass pairs of arguments (type => CodeRef).  The
+C<type> indicates the clause of the contract (pre or post) that the CodeRef
+should be applicable to.  Another special C<invar> type of clause is
+very similar to the C<post> type except that it doesn't receive the return
+values to verify (demonstrated below).
+
+Typically you will only want to use C<pre> and C<post> with the C<contract>
+method.
+
+For instance (using none of the sugar supplied below):
+
+	contract 'some_method',
+		pre => sub {
+			my($self,@params) = @_;
+			# do some validation here, dieing if validation fails
+		}
+		post => sub {
+			my($self, @return_values) = @_;
+			# do some validation here, dieing if validation fails
+		};
+
+You can provide as many C<pre> and C<post> hook but each of them must
+be preceded in the list by the lable (C<pre> or C<post>). They will be
+executed in the order they are listed and the first one that fails will
+result in the operation dieing.
+
+As noted below in the PERFORMANCE section, you can short circuit all
+functionality provided by this module by setting the NO_MOOSEX_CONTRACT
+environment variable.  That essentially makes the C<contract> sub a no-op.
+
+=head2 invariant
+
+This is a special kind of contract clause that adds a C<post> clause to all
+public method calls.  Typically you would use this to assert a specific
+characteristic about the object itself.
 
 =head2 check
 
@@ -95,23 +193,54 @@ This is pure sugar and simply returns the CodeRef that is passed in.
 
 =head2 assert
 
-This helper method creates a wrapper contract that will C<croak> if the
-underlying contract does not return a true value.
+This helper method creates a wrapper clause that will C<croak> if the
+underlying anonymous sub does not return a true value.
+
+	contract 'some_method'
+		pre => assert { 
+			
+		};
 
 =head2 accepts
 
-This helper method creates a C<pre> contract that looks at the value
-or values passed in to the method by the caller.
+This helper method takes an ArrayRef of Moose type constraints and creates
+a C<pre> clause that verifies the type of the value or values passed
+in to the method by the caller.  Any extra arguments passed to the method 
+that don't have explicit restrictions given to C<accepts> will be passed
+without validation (this may change in the future)
+
+	# method_a accepts at least two Int arguments
+	contract method_a => accepts ['Int', 'Int'];
+
+	# method_b accepts no arguments
+	contract method_b => accepts void;
+
+	# works with any type that Moose will recognize
+	my $cheezey = subtype 'Str', where { m/cheese/ };
+	contract method_c => accepts ['MyClass', 'ArrayRef[Str]', $cheezey];
 
 =head2 returns
 
-This helper method creates a C<post> contract that looks at the value
-or values returned by the method it's affecting.
+This helper method creates a C<post> clause that looks at the value
+or values returned by the method it's affecting.  PLEASE NOTE: these
+checks only have a chance to evaluate the values that are actually
+returned to the caller.  If the caller is using scalar context, then this
+validation will get the value that is returned when in scalar context.
+More importantly (surprisingly?)  if the caller is executing the statement
+in void context, these checks won't receive any return values to evaluate
+but may still validate the state of $self (the first argument received by
+the post hook).
 
 =head2 void
 
 A simple helper method that asserts zero items were passed (useful in
-specifying C<accepts> and C<returns> contracts).
+specifying C<accepts> and C<returns> clauses).
+
+=head2 with_context
+
+This helper method wraps a C<pre> and C<post> clause with closures that allow
+a values to be compared between the two clauses.  The C<SYNOPSIS> above shows
+an example of how to use this functionality.
 
 =cut
 
@@ -128,7 +257,7 @@ sub invariant {
 		$caller,
 		[
 			map { $_->name }
-			grep { exists( $packages{ $_->original_package_name } ) && $_->name ne 'meta' }
+			grep { $_->name ne 'meta' && $_->name !~ m/^_/ && exists( $packages{ $_->original_package_name } ) }
 					find_meta($caller)->get_all_methods
 		],
 		@checks
@@ -172,14 +301,16 @@ sub contract {
 					} else {
 						$retval[0] = $next->(@_);
 					}
-					foreach my $m ( @{ $args{post} } ) {
-						eval { $m->($self, @retval) };
-						croak "post contract error for $method: $@" if $@;
-					}
 				} else {
-					# Hm... we don't evaluate the return value when we're in void context
+					# no return values available in this case...
 					$next->(@_);
 				}
+
+				foreach my $m ( @{ $args{post} } ) {
+					eval { $m->($self, @retval) };
+					croak "post contract error for $method: $@" if $@;
+				}
+
 				foreach my $m( @{ $args{invar} } ){
 						eval { $m->($self) };
 						croak "invariant contract error for $method: $@" if $@;
@@ -203,14 +334,14 @@ sub accepts($) {
 }
 
 sub _make_type_validator {
-	my $contract_name = shift;
+	my $mode = shift;
 	my @expected = map { Moose::Util::TypeConstraints::find_or_parse_type_constraint($_) } @{ $_[0] };
 	return sub {
 		my $self = shift;
-		if ( @_ < @expected ) {
-			croak "$contract_name contract expects at least " . @expected . " values, only " . @_ . " parameters passed";
+		if ( $mode eq 'accepts' && @_ < @expected ) {
+			croak "$mode contract expects at least " . @expected . " values, only " . @_ . " parameters passed";
 		}
-		for ( my $i = 0 ; $i < @_ ; $i++ ) {
+		for ( my $i = 0 ; $i < @_ && $i < @expected ; $i++ ) {
 			my $error = $expected[$i]->validate( $_[$i] );
 			croak $error if $error;
 		}
@@ -232,6 +363,18 @@ sub returns($) {
 
 sub check(&) { return @_ };
 
+sub with_context {
+	my %args = @_;
+	if(!exists($args{pre}) || !exists($args{post})){
+		croak "both 'pre' and 'post' clauses must be specified when using context";
+	}
+	my $context;
+	return (
+		pre => sub { $context = $args{pre}->(@_) },
+		post => sub { $args{post}->( $context, @_ ) }
+	);
+}
+
 sub assert(&;$) {
 	my($code, $message) = @_;
 	$message ||= "assertion failed";
@@ -239,6 +382,43 @@ sub assert(&;$) {
 		$code->(@_) or croak $message;
 	}
 }
+
+=head1 PERFORMANCE
+
+As the saying goes, you never get something for nothing.  That is
+definitely the case with this module (or indeed any usage of Moose's
+method hooks).  At the time of this writing, L<Class::MOP> claims that an
+C<around> method hook is ~5x slower than a standard method invocation.
+This facter doesn't include any of the actual checks that are run as
+part of validating the contract so (short of doing actual profiling)
+I would guess using MooseX::Contract could slow your method calls down
+by up to 10x.
+
+That is a pretty considerable drawback to using the features of this
+module.  However, to mitigate this, MooseX::Contract allows you to
+turn off all method wrapping if it detects the C<NO_MOOSEX_CONTRACT>
+environment variable.  If you are about performance but wish to use some
+of the features of this module, you might want to enable these features
+only in your development or testing environment and let things run fast
+and free in production.
+
+=head1 A WORD OF CAUTION
+
+This module is by no means a comprehensive approach to DbC.  I have
+very limited experience with this style of programming and wrote this
+module more as a learning project than anything.
+
+=back
+
+=head1 SEE ALSO
+
+=over 4
+
+=item L<Sub::Contract>
+
+=item L<Class::Contract>
+
+=back
 
 =head1 AUTHOR
 
